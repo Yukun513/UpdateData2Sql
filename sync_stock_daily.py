@@ -10,7 +10,7 @@ from utils import (
     get_source_info,
     is_trading,
 )
-from fetch_data_f import (
+from data_sources import (
     MootdxDataFetcher,
     eastmoney_stock_info,
     fetch_mootdx_daily,
@@ -90,23 +90,23 @@ CREATE TABLE IF NOT EXISTS `stock_basic_info` (
 
 def init_tables(engine):
     with engine.connect() as conn:
-        for sql in [CREATE_INFO, CREATE_DATA, CREATE_BASIC]:
-            conn.execute(sqlalchemy.text(sql))
-        conn.commit()
+        with conn.begin():
+            for sql in [CREATE_INFO, CREATE_DATA, CREATE_BASIC]:
+                conn.execute(sqlalchemy.text(sql))
 
 
 def seed_config(engine, codes):
     """首次运行：写入默认标的到 stock_info_config"""
-    for code in codes:
-        for dtype in ["mootdx_klines", "tencent_quote", "margin_trading", "stock_info"]:
-            try:
-                with engine.connect() as conn:
-                    conn.execute(sqlalchemy.text(
-                        "INSERT IGNORE INTO stock_info_config (code, data_type) VALUES (:c, :d)"
-                    ), {"c": code, "d": dtype})
-                    conn.commit()
-            except Exception:
-                pass
+    with engine.connect() as conn:
+        with conn.begin():
+            for code in codes:
+                for dtype in ["mootdx_klines", "tencent_quote", "margin_trading", "stock_info"]:
+                    try:
+                        conn.execute(sqlalchemy.text(
+                            "INSERT IGNORE INTO stock_info_config (code, data_type) VALUES (:c, :d)"
+                        ), {"c": code, "d": dtype})
+                    except Exception:
+                        pass
 
 
 # ==============================================================================
@@ -114,10 +114,10 @@ def seed_config(engine, codes):
 # ==============================================================================
 
 def main():
-    """程序的主执行函数（对标 index_update）"""
+    """程序的主执行函数"""
 
     # ---- 默认标的（首次运行时自动写入 info 表，之后从 info 表读） ----
-    DEFAULT_CODES = ["600519", "000858", "688017", "300476"]
+    DEFAULT_CODES = ["600519", "000858", "688017", "300476","601991"]
 
     # ---- 定义表名 ----
     table_name = "stock_daily"
@@ -146,6 +146,9 @@ def main():
 
     # 3. 读取 info 表，获取标的列表
     info_df = get_source_info(engine, info_name)
+    if info_df.empty:
+        print(f"警告: {info_name} 表为空，请检查 seed_config")
+        return
     info_df["updated_date"] = pd.to_datetime(info_df["updated_date"])
 
     codes = sorted(info_df["code"].unique())
@@ -201,17 +204,17 @@ def main():
 
     # ---- 各数据源独立 upsert，互不踩踏 ----
     def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-        """清洗 DataFrame：去重列、过滤非交易日、NaN→None"""
+        """清洗 DataFrame:去重列、过滤非交易日、NaN→None"""
         df = df.loc[:, ~df.columns.duplicated()]
         df["date"] = pd.to_datetime(df["date"]).dt.date
         df = df[df["date"].apply(lambda d: is_trading(d, holidays))]
         return df
 
-    def upsert_columns(engine, table: str, df: pd.DataFrame):
+    def upsert_columns(engine, table: str, df: pd.DataFrame, keys=("date", "stock_code")):
         """将 DataFrame 按列 upsert 到表，只更新 DataFrame 中存在的列"""
         if df.empty:
             return
-        cols = [c for c in df.columns if c not in ("date", "stock_code")]
+        cols = [c for c in df.columns if c not in keys]
         cols_str = ", ".join(f"`{c}`" for c in df.columns)
         placeholders = ", ".join(f":{c}" for c in df.columns)
         update_clause = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in cols)

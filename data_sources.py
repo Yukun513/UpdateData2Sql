@@ -13,7 +13,7 @@ _session.trust_env = False
 
 
 def _get_with_retry(url, **kwargs):
-    """带重试的 GET 请求，指数退避+抖动"""
+    """带重试的 GET 请求，断连时换新 session，指数退避+抖动"""
     params = kwargs.pop("params", None)
     timeout = kwargs.pop("timeout", 10)
     for attempt in range(4):
@@ -24,7 +24,20 @@ def _get_with_retry(url, **kwargs):
         except Exception:
             if attempt == 3:
                 raise
+            # 断连后换新 session，避免复用死连接
+            if attempt >= 1:
+                _new_session()
             time.sleep(2 ** attempt + random.uniform(0, 1))
+
+
+def _new_session():
+    global _session
+    try:
+        _session.close()
+    except Exception:
+        pass
+    _session = requests.Session()
+    _session.trust_env = False
 
 _proxy_handler = urllib.request.ProxyHandler({})
 _no_proxy_opener = urllib.request.build_opener(_proxy_handler)
@@ -107,14 +120,15 @@ def eastmoney_stock_info(code: str) -> dict:
     东财个股基本面信息。
     返回: {code, name, industry, total_shares, float_shares, mcap, float_mcap, list_date, price}
     """
-    market_code = 1 if code.startswith("6") else 0
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    market_code = 1 if code.startswith(("6", "9")) else 0
+    server_node = random.randint(1, 99)
+    url = f"http://{server_node}.push2.eastmoney.com/api/qt/stock/get"
     params = {
         "fltt": "2", "invt": "2",
         "fields": "f57,f58,f84,f85,f127,f116,f117,f189,f43",
         "secid": f"{market_code}.{code}",
     }
-    r = _get_with_retry(url, params=params, headers={"User-Agent": UA})
+    r = _get_with_retry(url, params=params, headers={"User-Agent": UA, "Referer": "http://quote.eastmoney.com/"})
     d = r.json().get("data", {})
     return {
         "code": d.get("f57", ""),
@@ -217,23 +231,23 @@ class MootdxDataFetcher:
             if df is None or df.empty:
                 return pd.DataFrame()
 
-            # 清理由 mootdx 返回的 DataFrame
+            # mootdx 返回的 DataFrame 以 datetime 为索引，但可能同时存在同名列
+            # 先删掉列中的 datetime（索引的副本），再 reset_index 避免列名冲突
             for c in list(df.columns):
                 if c.lower() == "datetime":
                     del df[c]
             df = df.reset_index()
-            df.rename(columns={"datetime": "date"}, inplace=True)
-            df["date"] = pd.to_datetime(df["date"])
-
-            # 统一列名
             rename_map = {}
             for c in df.columns:
                 cl = c.lower()
-                if cl == "vol":
+                if cl == "datetime":
+                    rename_map[c] = "date"
+                elif cl == "vol":
                     rename_map[c] = "volume"
                 elif cl == "amount":
                     rename_map[c] = "amt"
             df.rename(columns=rename_map, inplace=True)
+            df["date"] = pd.to_datetime(df["date"])
 
             cols = ["date", "open", "high", "low", "close", "volume", "amt"]
             cols = [c for c in cols if c in df.columns]
@@ -247,7 +261,7 @@ class MootdxDataFetcher:
 
 
 # ==============================================================================
-#                    对外适配函数（供 stock_update 调用）
+#                    对外适配函数（供 sync_stock_daily 调用）
 # ==============================================================================
 
 def fetch_mootdx_daily(fetcher: MootdxDataFetcher, code: str,
